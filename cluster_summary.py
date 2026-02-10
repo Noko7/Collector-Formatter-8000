@@ -126,6 +126,127 @@ def safe_round(val, decimals=2):
     except:
         return 0
 
+def normalize_column_names(df, column_mappings):
+    """
+    Normalize column names by renaming variations to expected names.
+    
+    Args:
+        df: DataFrame to normalize
+        column_mappings: Dict mapping expected_name -> list of possible variations
+    
+    Returns:
+        DataFrame with renamed columns
+    """
+    rename_map = {}
+    for expected_name, variations in column_mappings.items():
+        if expected_name not in df.columns:
+            for variation in variations:
+                if variation in df.columns:
+                    rename_map[variation] = expected_name
+                    break
+    if rename_map:
+        df = df.rename(columns=rename_map)
+    return df
+
+def get_column_safe(df, column_name, default=0):
+    """
+    Safely get a column from DataFrame, returning default if not present.
+    
+    Args:
+        df: DataFrame to access
+        column_name: Name of column to retrieve
+        default: Default value if column doesn't exist
+    
+    Returns:
+        Column Series or Series of default values
+    """
+    if column_name in df.columns:
+        return df[column_name]
+    return pd.Series([default] * len(df), index=df.index)
+
+# Column name mappings for vHosts - maps expected name to possible variations
+VHOSTS_COLUMN_MAPPINGS = {
+    'Free Space (MiB)': ['Freespace (MiB)', 'FreeSpace (MiB)', 'Free Space(MiB)', 'Freespace(MiB)'],
+    'Service Tag': ['ServiceTag', 'Service_Tag', 'Serial Number', 'Serial'],
+    'Maintenance Mode': ['MaintenanceMode', 'Maintenance_Mode', 'Maint Mode'],
+}
+
+# ============================================================================
+# FILE SAVING WITH ERROR HANDLING
+# ============================================================================
+
+def save_file_with_retry(save_func, filepath, max_retries=3):
+    """
+    Attempt to save a file with retry logic for permission errors.
+    If file is locked, tries alternative filenames with timestamps.
+    
+    Args:
+        save_func: Callable that takes filepath and saves the file
+        filepath: Path object or string for the target file
+        max_retries: Number of alternative filenames to try
+    
+    Returns:
+        Path: The actual path where the file was saved
+    
+    Raises:
+        PermissionError: If all retries fail
+    """
+    from datetime import datetime
+    filepath = Path(filepath)
+    
+    # First attempt: try the original filename
+    try:
+        save_func(filepath)
+        return filepath
+    except PermissionError as e:
+        print(f"  WARNING: Cannot save to {filepath.name} - file may be open in another application.")
+    
+    # Retry with alternative filenames
+    for retry in range(1, max_retries + 1):
+        timestamp = datetime.now().strftime("%H%M%S")
+        alt_name = f"{filepath.stem}_{timestamp}{filepath.suffix}"
+        alt_path = filepath.parent / alt_name
+        
+        try:
+            print(f"  Trying alternative filename: {alt_name}")
+            save_func(alt_path)
+            print(f"  Successfully saved to: {alt_path}")
+            return alt_path
+        except PermissionError:
+            if retry < max_retries:
+                import time
+                time.sleep(0.5)  # Brief pause before next retry
+                continue
+    
+    # All retries failed
+    raise PermissionError(
+        f"Cannot save file - all attempts failed.\n"
+        f"  Target: {filepath}\n"
+        f"  Please close the file if it's open in Excel or another application,\n"
+        f"  then run the script again."
+    )
+
+def save_text_file_safe(filepath, content):
+    """
+    Save text content to a file with error handling.
+    
+    Args:
+        filepath: Path to save to
+        content: String content to write
+    
+    Returns:
+        Path: The actual path where the file was saved, or None if failed
+    """
+    def do_save(path):
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+    
+    try:
+        return save_file_with_retry(do_save, filepath)
+    except PermissionError as e:
+        print(f"  WARNING: Could not save validation report: {e}")
+        return None
+
 # ============================================================================
 # EXCEL STYLING
 # ============================================================================
@@ -342,6 +463,10 @@ def process_collector(input_dir, output_prefix, output_excel, output_csv, valida
     
     # Prepare host data with numeric conversions
     host_df = vhosts.copy()
+    
+    # Normalize column names to handle variations across collector versions
+    host_df = normalize_column_names(host_df, VHOSTS_COLUMN_MAPPINGS)
+    
     host_df['CPUs'] = pd.to_numeric(host_df['CPUs'], errors='coerce').fillna(0).astype(int)
     host_df['CPU Cores'] = pd.to_numeric(host_df['CPU Cores'], errors='coerce').fillna(0).astype(int)
     host_df['Cores per CPU'] = pd.to_numeric(host_df['Cores per CPU'], errors='coerce').fillna(0).astype(int)
@@ -351,9 +476,9 @@ def process_collector(input_dir, output_prefix, output_excel, output_csv, valida
     host_df['CPU Speed'] = pd.to_numeric(host_df['CPU Speed'], errors='coerce').fillna(0)
     host_df['Capacity (MiB)'] = pd.to_numeric(host_df['Capacity (MiB)'], errors='coerce').fillna(0)
     host_df['Consumed (MiB)'] = pd.to_numeric(host_df['Consumed (MiB)'], errors='coerce').fillna(0)
-    host_df['Free Space (MiB)'] = pd.to_numeric(host_df['Free Space (MiB)'], errors='coerce').fillna(0)
-    host_df['GPU Count'] = pd.to_numeric(host_df['GPU Count'], errors='coerce').fillna(0).astype(int)
-    host_df['GPU Memory Size (MiB)'] = pd.to_numeric(host_df['GPU Memory Size (MiB)'], errors='coerce').fillna(0)
+    host_df['Free Space (MiB)'] = pd.to_numeric(get_column_safe(host_df, 'Free Space (MiB)', 0), errors='coerce').fillna(0)
+    host_df['GPU Count'] = pd.to_numeric(get_column_safe(host_df, 'GPU Count', 0), errors='coerce').fillna(0).astype(int)
+    host_df['GPU Memory Size (MiB)'] = pd.to_numeric(get_column_safe(host_df, 'GPU Memory Size (MiB)', 0), errors='coerce').fillna(0)
     
     # Aggregate per cluster
     host_agg = host_df.groupby('Cluster').agg({
@@ -654,8 +779,16 @@ def process_collector(input_dir, output_prefix, output_excel, output_csv, valida
         ws.column_dimensions['I'].width = 45  # CPU Model
         
         print(f"Saving Excel file to {output_excel}...")
-        wb.save(output_excel)
-        print(f"Output: {output_excel}")
+        
+        def save_workbook(path):
+            wb.save(path)
+        
+        try:
+            actual_path = save_file_with_retry(save_workbook, output_excel)
+            print(f"Output: {actual_path}")
+        except PermissionError as e:
+            print(f"ERROR: {e}")
+            raise
     
     else:
         # Fallback to CSV if openpyxl not available
@@ -707,8 +840,15 @@ def process_collector(input_dir, output_prefix, output_excel, output_csv, valida
             # Blank separator
             output_rows.append({col: '' for col in all_columns})
         
-        pd.DataFrame(output_rows).to_csv(output_csv, index=False, header=False)
-        print(f"Output: {output_csv}")
+        def save_csv(path):
+            pd.DataFrame(output_rows).to_csv(path, index=False, header=False)
+        
+        try:
+            actual_path = save_file_with_retry(save_csv, output_csv)
+            print(f"Output: {actual_path}")
+        except PermissionError as e:
+            print(f"ERROR: {e}")
+            raise
     
     # -------------------------------------------------------------------------
     # 9. VALIDATION REPORT
@@ -731,9 +871,10 @@ def process_collector(input_dir, output_prefix, output_excel, output_csv, valida
         validation_lines.append(f"  Vendors: {row.get('Vendors', 'N/A')}")
         validation_lines.append(f"  Models: {row.get('Host_Models', 'N/A')}")
     
-    with open(validation_report, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(validation_lines))
-    print(f"Validation: {validation_report}")
+    validation_content = '\n'.join(validation_lines)
+    actual_validation_path = save_text_file_safe(validation_report, validation_content)
+    if actual_validation_path:
+        print(f"Validation: {actual_validation_path}")
     
     print("Done processing this collector!")
     return True
